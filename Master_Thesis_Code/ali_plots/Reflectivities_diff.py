@@ -1,0 +1,638 @@
+# -*- coding: utf-8 -*-
+
+#%%
+from __future__ import print_function
+
+import datetime
+import warnings
+from pathlib import Path
+
+import matplotlib.dates as mdates
+import matplotlib.patches as patches
+import matplotlib.pyplot as plt
+import netCDF4 as nc
+import numpy as np
+import pandas as pd
+from matplotlib.cm import get_cmap
+from netCDF4 import Dataset
+from scipy.interpolate import interp1d
+from utils import load_radar_data
+from wrf import ALL_TIMES, getvar, to_np
+
+plt.rcParams['figure.facecolor']='white'
+
+#suppress warnings
+warnings.filterwarnings('ignore')
+
+wrf_time = np.arange(np.datetime64('2021-12-17T21:00'), np.datetime64('2021-12-19T12:05'),dtype='datetime64[s]')[::300]
+spin_up = np.where(wrf_time == np.datetime64('2021-12-17T22:00'))[0][0]
+end = np.where(wrf_time == np.datetime64('2021-12-19T12:00'))[0][0] + 1
+wrf_time = wrf_time[spin_up:end]
+
+start_time = datetime.datetime(2021, 12, 17, 18, 0)  # Start time of the timeseries
+end_time = datetime.datetime(2021, 12, 19, 14, 0)  # End time of the timeseries
+
+tick_locs = mdates.drange(start_time + datetime.timedelta(hours=6), end_time, datetime.timedelta(hours=6))
+tick_labels = [mdates.num2date(t).strftime('%d/%m'+'\n'+ '%H:%M') for t in tick_locs]
+
+
+def load_wprof_data(file_path):
+    nc = Dataset(file_path)
+    dtime = nc.variables['Time'][:].astype(int)
+    time = [datetime.datetime.utcfromtimestamp(tt) for tt in dtime]
+    SNR = nc.variables['SnR'][:]
+    Ze = nc.variables['Ze'][:]
+    Ze[SNR<-14]=np.nan
+    Ze_corr = nc.variables['Ze_corrected'][:]
+    Ze_corr[SNR<-14]=np.nan
+    Rgates = nc.variables['Rgate'][:]
+    
+    return time, Ze, Ze_corr, Rgates
+
+
+def load_crsim_data(data_dir, file_prefix, spin_up, end):
+    REFL = np.load(f"{data_dir}{file_prefix}.npy")[spin_up:end]
+    return REFL
+
+
+###################################
+# W-prof reflectivity data        #
+###################################
+wprof_time, carmel_Ze, carmel_Ze_corr, Rgates = load_wprof_data('../vivi_paper/Data/WProf/Attenuation_correction/HELMOS_att_corr.nc')
+
+radar_time = np.array(wprof_time, dtype='datetime64[s]')
+
+
+###################
+# CR-SIM data     #
+###################
+REFL_CONTROL = load_radar_data(
+      Path("./ali_radar_data/REFL_control.npy"), 
+      Path("./ali_radar_data/time_REFL_control.npy"),
+      np.datetime64('2021-12-17T22:00'),
+      np.datetime64('2021-12-19T12:00')
+)
+REFL_DEMOTT = load_radar_data(
+      Path("./ali_radar_data/REFL_demott.npy"), 
+      Path("./ali_radar_data/time_REFL_demott.npy"),
+      np.datetime64('2021-12-17T22:00'),
+      np.datetime64('2021-12-19T12:00')
+)
+REFL_ALLSIP = load_radar_data(
+      Path("./ali_radar_data/REFL_allsip.npy"), 
+      Path("./ali_radar_data/time_REFL_allsip.npy"),
+      np.datetime64('2021-12-17T22:00'),
+      np.datetime64('2021-12-19T12:00')
+)
+
+
+######################
+# WRF model outputs  #
+######################
+out_dir ='/home/waseem/Helmos_data_60h'
+
+simuALLSIP = out_dir + '/wrfout_Helmos_d03_ALLSIP_VL.nc'
+ALLSIP = Dataset(simuALLSIP)
+
+simuCONTROL = out_dir + '/wrfout_Helmos_d03_CONTROL_VL.nc'
+CONTROL = Dataset(simuCONTROL)
+
+simuDEMOTT = out_dir + '/wrfout_Helmos_d03_DEMOTT_VL.nc'
+DEMOTT = Dataset(simuDEMOTT)
+
+
+###################
+# CR-SIM data     #
+###################
+crsim_data_dir_old = '../vivi_paper/Data/CR-SIM/'
+REFL_CONTROL_old = load_crsim_data(crsim_data_dir_old, 'REFL_CONTROL_VL', spin_up,end)
+REFL_DEMOTT_old = load_crsim_data(crsim_data_dir_old, 'REFL_DEMOTT_VL', spin_up,end)
+REFL_ALLSIP_old = load_crsim_data(crsim_data_dir_old, 'REFL_ALLSIP_VL', spin_up,end)
+
+
+######################
+# WRF model outputs  #
+######################
+out_dir_old ='../vivi_paper/Data/WRF'
+
+simuALLSIP_old = out_dir_old + '/wrfout_d03_ALLSIP_VL.nc'
+ALLSIP_old = Dataset(simuALLSIP_old)
+
+simuCONTROL_old = out_dir_old + '/wrfout_d03_CONTROL_VL.nc'
+CONTROL_old = Dataset(simuCONTROL_old)
+
+simuDEMOTT_old = out_dir_old + '/wrfout_d03_DEMOTT_VL.nc'
+DEMOTT_old = Dataset(simuDEMOTT_old)
+
+
+
+
+### WRF constants
+RA=287.15
+RD=287.0
+CP=1004.5
+P1000MB=100000.0
+EPS=0.622
+        
+presCONTROL = np.squeeze(CONTROL.variables['P'][:] + CONTROL.variables['PB'][:])
+thetCONTROL = np.squeeze(CONTROL.variables['T'][:] + 300.0)
+qvCONTROL = np.squeeze(CONTROL.variables['QVAPOR'][:])
+tkCONTROL = ((presCONTROL / P1000MB)**(RD/CP) * thetCONTROL)
+tvCONTROL = tkCONTROL * (EPS + qvCONTROL) / (EPS * (1. + qvCONTROL))
+rhoCONTROL = presCONTROL/RA/tvCONTROL
+lwcCONTROL = np.squeeze(CONTROL.variables['QCLOUD'][:] + CONTROL.variables['QRAIN'][:])*rhoCONTROL*10**3 #gm-3
+lwcCONTROL[lwcCONTROL <= 10**(-5)] = np.nan
+zstagCONTROL = np.squeeze(getvar(CONTROL,"zstag",timeidx=ALL_TIMES))
+zstagCONTROL = zstagCONTROL[:]
+dzCONTROL = np.diff(zstagCONTROL,axis=1)
+lwpCONTROL = np.nansum(lwcCONTROL*dzCONTROL,axis=1)
+T2mCONTROL = np.array(getvar(CONTROL,"T2",timeidx=ALL_TIMES)-273.15)
+tCONTROL = tkCONTROL - 273.15
+
+PHB = np.squeeze(CONTROL.variables["PHB"][0,:])
+PH = np.squeeze(CONTROL.variables["PH"][0,:])
+HGT = np.squeeze(CONTROL.variables["HGT"][0])
+ZZASL = (PH+PHB)/9.81
+ZZ = (PH+PHB)/9.81-HGT
+ZZ_km = ZZ/1000
+dz=np.zeros((len(ZZ)-1))
+ZZmiddle=np.zeros((len(ZZ)-1))
+
+kk = 0
+
+for jj in range(len(ZZ)-1):
+        dz[kk] = (ZZ[kk+1]-ZZ[kk])/2
+        ZZmiddle[kk] = dz[kk] + ZZ[kk]
+        kk=kk+1
+        
+presDEMOTT = np.squeeze(DEMOTT.variables['P'][:] + DEMOTT.variables['PB'][:])
+thetDEMOTT = np.squeeze(DEMOTT.variables['T'][:] + 300.0)
+qvDEMOTT = np.squeeze(DEMOTT.variables['QVAPOR'][:])
+tkDEMOTT = ((presDEMOTT / P1000MB)**(RD/CP) * thetDEMOTT)
+tvDEMOTT = tkDEMOTT * (EPS + qvDEMOTT) / (EPS * (1. + qvDEMOTT))
+rhoDEMOTT = presDEMOTT/RA/tvDEMOTT
+lwcDEMOTT = np.squeeze(DEMOTT.variables['QCLOUD'][:] + DEMOTT.variables['QRAIN'][:])*rhoDEMOTT*10**3 #gm-3
+lwcDEMOTT[lwcDEMOTT <= 10**(-5)] = np.nan
+zstagDEMOTT = np.squeeze(getvar(DEMOTT,"zstag",timeidx=ALL_TIMES))
+zstagDEMOTT = zstagDEMOTT[:]
+dzDEMOTT = np.diff(zstagDEMOTT,axis=1)
+lwpDEMOTT = np.nansum(lwcDEMOTT*dzDEMOTT,axis=1)
+T2mDEMOTT = np.array(getvar(DEMOTT,"T2",timeidx=ALL_TIMES)-273.15)
+tDEMOTT = tkDEMOTT - 273.15
+
+PHB2 = np.squeeze(DEMOTT.variables["PHB"][0,:])
+PH2 = np.squeeze(DEMOTT.variables["PH"][0,:])
+HGT2 = np.squeeze(DEMOTT.variables["HGT"][0])
+ZZASL2 = (PH2+PHB2)/9.81
+ZZ2 = (PH2+PHB2)/9.81-HGT2
+ZZ_km2 = ZZ2/1000
+dz2=np.zeros((len(ZZ2)-1))
+ZZmiddle2=np.zeros((len(ZZ2)-1))
+
+kk = 0
+
+for jj in range(len(ZZ2)-1):
+        dz2[kk] = (ZZ2[kk+1]-ZZ2[kk])/2
+        ZZmiddle2[kk] = dz2[kk] + ZZ2[kk]
+        kk=kk+1
+
+presALLSIP = np.squeeze(ALLSIP.variables['P'][:] + ALLSIP.variables['PB'][:])
+thetALLSIP = np.squeeze(ALLSIP.variables['T'][:] + 300.0)
+qvALLSIP = np.squeeze(ALLSIP.variables['QVAPOR'][:])
+tkALLSIP = ((presALLSIP / P1000MB)**(RD/CP) * thetALLSIP)
+tvALLSIP = tkALLSIP * (EPS + qvALLSIP) / (EPS * (1. + qvALLSIP))
+rhoALLSIP = presALLSIP/RA/tvALLSIP
+lwcALLSIP = np.squeeze(ALLSIP.variables['QCLOUD'][:] + ALLSIP.variables['QRAIN'][:])*rhoALLSIP*10**3 #gm-3
+lwcALLSIP[lwcALLSIP <= 10**(-5)] = np.nan
+zstagALLSIP = np.squeeze(getvar(ALLSIP,"zstag",timeidx=ALL_TIMES))
+zstagALLSIP = zstagALLSIP[:]
+dzALLSIP = np.diff(zstagALLSIP,axis=1)
+lwpALLSIP = np.nansum(lwcALLSIP*dzALLSIP,axis=1)
+T2mALLSIP = np.array(getvar(ALLSIP,"T2",timeidx=ALL_TIMES)-273.15)
+tALLSIP = tkALLSIP - 273.15
+
+PHB3 = np.squeeze(ALLSIP.variables["PHB"][0,:])
+PH3 = np.squeeze(ALLSIP.variables["PH"][0,:])
+HGT3 = np.squeeze(ALLSIP.variables["HGT"][0])
+ZZASL3 = (PH3+PHB3)/9.81
+ZZ3 = (PH3+PHB3)/9.81-HGT3
+ZZ_km3 = ZZ3/1000
+dz3=np.zeros((len(ZZ3)-1))
+ZZmiddle3=np.zeros((len(ZZ3)-1))
+
+kk = 0
+
+for jj in range(len(ZZ3)-1):
+        dz3[kk] = (ZZ3[kk+1]-ZZ3[kk])/2
+        ZZmiddle3[kk] = dz3[kk] + ZZ3[kk]
+        kk=kk+1
+
+
+lwpALLSIP = lwpALLSIP[spin_up:end] ; T2mALLSIP = T2mALLSIP[spin_up:end]
+lwpCONTROL = lwpCONTROL[spin_up:end] ; T2mCONTROL = T2mCONTROL[spin_up:end]
+lwpDEMOTT = lwpDEMOTT[spin_up:end] ; T2mDEMOTT = T2mDEMOTT[spin_up:end]
+
+tALLSIP = tALLSIP[spin_up:end]
+tCONTROL = tCONTROL[spin_up:end]
+tDEMOTT = tDEMOTT[spin_up:end]
+
+
+########################
+### Old WRF Analysis ###
+########################
+
+presCONTROL_old = np.squeeze(CONTROL_old.variables['P'][:] + CONTROL_old.variables['PB'][:])
+thetCONTROL_old = np.squeeze(CONTROL_old.variables['T'][:] + 300.0)
+qvCONTROL_old = np.squeeze(CONTROL_old.variables['QVAPOR'][:])
+tkCONTROL_old = ((presCONTROL_old / P1000MB)**(RD/CP) * thetCONTROL_old)
+tvCONTROL_old = tkCONTROL_old * (EPS + qvCONTROL_old) / (EPS * (1. + qvCONTROL_old))
+rhoCONTROL_old = presCONTROL_old/RA/tvCONTROL_old
+lwcCONTROL_old = np.squeeze(CONTROL_old.variables['QCLOUD'][:] + CONTROL_old.variables['QRAIN'][:])*rhoCONTROL_old*10**3 #gm-3
+lwcCONTROL_old[lwcCONTROL_old <= 10**(-5)] = np.nan
+zstagCONTROL_old = np.squeeze(getvar(CONTROL_old,"zstag",timeidx=ALL_TIMES))
+zstagCONTROL_old = zstagCONTROL_old[:]
+dzCONTROL_old = np.diff(zstagCONTROL_old,axis=1)
+lwpCONTROL_old = np.nansum(lwcCONTROL_old*dzCONTROL_old,axis=1)
+T2mCONTROL_old = np.array(getvar(CONTROL_old,"T2",timeidx=ALL_TIMES)-273.15)
+tCONTROL_old = tkCONTROL_old - 273.15
+
+PHB_old = np.squeeze(CONTROL_old.variables["PHB"][0,:])
+PH_old = np.squeeze(CONTROL_old.variables["PH"][0,:])
+HGT_old = np.squeeze(CONTROL_old.variables["HGT"][0])
+ZZASL_old = (PH_old+PHB_old)/9.81
+ZZ_old = (PH_old+PHB_old)/9.81-HGT_old
+ZZ_km_old = ZZ_old/1000
+dz_old=np.zeros((len(ZZ_old)-1))
+ZZmiddle_old=np.zeros((len(ZZ_old)-1))
+
+kk = 0
+
+for jj in range(len(ZZ)-1):
+        dz_old[kk] = (ZZ_old[kk+1]-ZZ_old[kk])/2
+        ZZmiddle_old[kk] = dz_old[kk] + ZZ_old[kk]
+        kk=kk+1
+        
+presDEMOTT_old = np.squeeze(DEMOTT_old.variables['P'][:] + DEMOTT_old.variables['PB'][:])
+thetDEMOTT_old = np.squeeze(DEMOTT_old.variables['T'][:] + 300.0)
+qvDEMOTT_old = np.squeeze(DEMOTT_old.variables['QVAPOR'][:])
+tkDEMOTT_old = ((presDEMOTT_old / P1000MB)**(RD/CP) * thetDEMOTT_old)
+tvDEMOTT_old = tkDEMOTT_old * (EPS + qvDEMOTT_old) / (EPS * (1. + qvDEMOTT_old))
+rhoDEMOTT_old = presDEMOTT/RA/tvDEMOTT
+lwcDEMOTT_old = np.squeeze(DEMOTT_old.variables['QCLOUD'][:] + DEMOTT_old.variables['QRAIN'][:])*rhoDEMOTT_old*10**3 #gm-3
+lwcDEMOTT_old[lwcDEMOTT_old <= 10**(-5)] = np.nan
+zstagDEMOTT_old = np.squeeze(getvar(DEMOTT_old,"zstag",timeidx=ALL_TIMES))
+zstagDEMOTT_old = zstagDEMOTT_old[:]
+dzDEMOTT_old = np.diff(zstagDEMOTT_old,axis=1)
+lwpDEMOTT_old = np.nansum(lwcDEMOTT_old*dzDEMOTT_old,axis=1)
+T2mDEMOTT_old = np.array(getvar(DEMOTT_old,"T2",timeidx=ALL_TIMES)-273.15)
+tDEMOTT_old = tkDEMOTT_old - 273.15
+
+PHB2_old = np.squeeze(DEMOTT_old.variables["PHB"][0,:])
+PH2_old = np.squeeze(DEMOTT_old.variables["PH"][0,:])
+HGT2_old = np.squeeze(DEMOTT_old.variables["HGT"][0])
+ZZASL2_old = (PH2_old+PHB2_old)/9.81
+ZZ2_old = (PH2_old+PHB2_old)/9.81-HGT2_old
+ZZ_km2_old = ZZ2_old/1000
+dz2_old=np.zeros((len(ZZ2_old)-1))
+ZZmiddle2_old=np.zeros((len(ZZ2_old)-1))
+
+kk = 0
+
+for jj in range(len(ZZ2_old)-1):
+        dz2_old[kk] = (ZZ2_old[kk+1]-ZZ2_old[kk])/2
+        ZZmiddle2_old[kk] = dz2_old[kk] + ZZ2_old[kk]
+        kk=kk+1
+
+presALLSIP_old = np.squeeze(ALLSIP_old.variables['P'][:] + ALLSIP_old.variables['PB'][:])
+thetALLSIP_old = np.squeeze(ALLSIP_old.variables['T'][:] + 300.0)
+qvALLSIP_old = np.squeeze(ALLSIP_old.variables['QVAPOR'][:])
+tkALLSIP_old = ((presALLSIP_old / P1000MB)**(RD/CP) * thetALLSIP_old)
+tvALLSIP_old = tkALLSIP_old * (EPS + qvALLSIP_old) / (EPS * (1. + qvALLSIP_old))
+rhoALLSIP_old = presALLSIP_old/RA/tvALLSIP_old
+lwcALLSIP_old = np.squeeze(ALLSIP_old.variables['QCLOUD'][:] + ALLSIP_old.variables['QRAIN'][:])*rhoALLSIP_old*10**3 #gm-3
+lwcALLSIP_old[lwcALLSIP <= 10**(-5)] = np.nan
+zstagALLSIP_old = np.squeeze(getvar(ALLSIP_old,"zstag",timeidx=ALL_TIMES))
+zstagALLSIP_old = zstagALLSIP_old[:]
+dzALLSIP_old = np.diff(zstagALLSIP_old,axis=1)
+lwpALLSIP_old = np.nansum(lwcALLSIP_old*dzALLSIP_old,axis=1)
+T2mALLSIP_old = np.array(getvar(ALLSIP_old,"T2",timeidx=ALL_TIMES)-273.15)
+tALLSIP_old = tkALLSIP_old - 273.15
+
+PHB3_old = np.squeeze(ALLSIP_old.variables["PHB"][0,:])
+PH3_old = np.squeeze(ALLSIP_old.variables["PH"][0,:])
+HGT3_old = np.squeeze(ALLSIP_old.variables["HGT"][0])
+ZZASL3_old = (PH3_old+PHB3_old)/9.81
+ZZ3_old = (PH3_old+PHB3_old)/9.81-HGT3_old
+ZZ_km3_old = ZZ3_old/1000
+dz3_old=np.zeros((len(ZZ3_old)-1))
+ZZmiddle3_old=np.zeros((len(ZZ3_old)-1))
+
+kk = 0
+
+for jj in range(len(ZZ3_old)-1):
+        dz3_old[kk] = (ZZ3_old[kk+1]-ZZ3_old[kk])/2
+        ZZmiddle3_old[kk] = dz3_old[kk] + ZZ3_old[kk]
+        kk=kk+1
+
+
+lwpALLSIP_old = lwpALLSIP_old[spin_up:end] ; T2mALLSIP_old = T2mALLSIP[spin_up:end]
+lwpCONTROL_old = lwpCONTROL_old[spin_up:end] ; T2mCONTROL_old = T2mCONTROL[spin_up:end]
+lwpDEMOTT_old = lwpDEMOTT_old[spin_up:end] ; T2mDEMOTT_old = T2mDEMOTT[spin_up:end]
+
+tALLSIP_old = tALLSIP_old[spin_up:end]
+tCONTROL_old = tCONTROL_old[spin_up:end]
+tDEMOTT_old = tDEMOTT_old[spin_up:end]
+
+### 1st period ###
+#radar
+t1a = np.datetime64('2021-12-17T22:00')
+t2a = np.datetime64('2021-12-18T06:00')
+#control
+t3a = np.datetime64('2021-12-17T22:00')
+t4a = np.datetime64('2021-12-18T04:20') 
+#allsip
+t5a = np.datetime64('2021-12-17T22:00')
+t6a = np.datetime64('2021-12-18T04:45')
+#demott
+t7a = np.datetime64('2021-12-17T22:00')
+t8a = np.datetime64('2021-12-18T04:20')
+
+
+### 2nd period ###
+#radar
+t1b = np.datetime64('2021-12-18T07:30')
+t2b = np.datetime64('2021-12-18T12:00')
+#control
+t3b = np.datetime64('2021-12-18T07:30')
+t4b = np.datetime64('2021-12-18T16:20')
+#allsip
+t5b = np.datetime64('2021-12-18T07:30')
+t6b = np.datetime64('2021-12-18T17:45')
+#demott
+t7b = np.datetime64('2021-12-18T07:30')
+t8b = np.datetime64('2021-12-18T17:20') 
+
+
+### 3rd period ###
+#radar
+t1c = np.datetime64('2021-12-18T12:00')
+t2c = np.datetime64('2021-12-19T12:00')
+#control
+t3c = np.datetime64('2021-12-18T16:20')
+t4c = np.datetime64('2021-12-19T12:00')
+#allsip
+t5c = np.datetime64('2021-12-18T17:45')
+t6c = np.datetime64('2021-12-19T12:00')
+#demott
+t7c = np.datetime64('2021-12-18T17:20')
+t8c = np.datetime64('2021-12-19T12:00')
+
+
+
+#############################
+# Calculations for FigureS1 #
+#############################
+df = pd.DataFrame(carmel_Ze_corr, index=radar_time)
+df.index = pd.to_datetime(df.index, unit='s')
+resampled_df = df.resample('5T').mean()
+averaged_Ze = resampled_df.to_numpy()
+new_time_array = resampled_df.index.to_numpy()
+
+radar_time_float = radar_time.astype('float')
+wrf_time_float = wrf_time.astype('float')
+
+interp_func1d = interp1d(radar_time_float, carmel_Ze_corr, axis=0, kind='linear')
+Ze_plot_interp1d = interp_func1d(wrf_time_float)
+
+### Median profiles between 1.8 and 2 km ###
+Wprof_median = np.nanmedian(averaged_Ze[:,183:190],axis=1)
+Wprof_p25 = np.nanpercentile(averaged_Ze[:,183:190],25,axis=1)
+Wprof_p75 = np.nanpercentile(averaged_Ze[:,183:190],75,axis=1)
+
+Wprof_median_int = np.nanmedian(Ze_plot_interp1d[:,183:190],axis=1)
+Wprof_p25_int = np.nanpercentile(Ze_plot_interp1d[:,183:190],25,axis=1)
+Wprof_p75_int = np.nanpercentile(Ze_plot_interp1d[:,183:190],75,axis=1)
+
+
+
+######### Plotting ##########
+figures_directory='./Figures'
+csfont = {'fontname':'Comic Sans MS'}
+
+plt.rc('font', size=14)
+plt.rc('axes', titlesize=14)
+plt.rc('axes', labelsize=14)
+plt.rc('xtick', labelsize=14)
+plt.rc('ytick', labelsize=14)
+plt.rc('legend', fontsize=14)
+plt.rc('figure', titlesize=14)
+
+z1=0
+z2=5
+z3=2
+
+# create the rectangle patch
+rect1 = patches.Rectangle((t1a, z1), t2a - t1a, z2 - z1, linewidth=3, edgecolor='turquoise', facecolor='none', linestyle='solid')
+rect2 = patches.Rectangle((t3a, z1), t4a - t3a, z2 - z1, linewidth=3, edgecolor='turquoise', facecolor='none', linestyle='solid')
+rect3 = patches.Rectangle((t7a, z1), t8a - t7a, z2 - z1, linewidth=3, edgecolor='turquoise', facecolor='none', linestyle='solid')
+rect4 = patches.Rectangle((t5a, z1), t6a - t5a, z2 - z1, linewidth=3, edgecolor='turquoise', facecolor='none', linestyle='solid')
+
+rect12 = patches.Rectangle((t1b, z1), t2b - t1b, z2 - z1, linewidth=3, edgecolor='turquoise', facecolor='none', linestyle='solid')
+rect22 = patches.Rectangle((t3b, z1), t4b - t3b, z2 - z1, linewidth=3, edgecolor='turquoise', facecolor='none', linestyle='solid')
+rect32 = patches.Rectangle((t7b, z1), t8b - t7b, z2 - z1, linewidth=3, edgecolor='turquoise', facecolor='none', linestyle='solid')
+rect42 = patches.Rectangle((t5b, z1), t6b - t5b, z2 - z1, linewidth=3, edgecolor='turquoise', facecolor='none', linestyle='solid')
+
+rect13 = patches.Rectangle((t1c, z1), t2c - t1c, z3 - z1, linewidth=3, edgecolor='turquoise', facecolor='none', linestyle='solid')
+rect23 = patches.Rectangle((t3c, z1), t4c - t3c, z3 - z1, linewidth=3, edgecolor='turquoise', facecolor='none', linestyle='solid')
+rect33 = patches.Rectangle((t7c, z1), t8c - t7c, z3 - z1, linewidth=3, edgecolor='turquoise', facecolor='none', linestyle='solid')
+rect43 = patches.Rectangle((t5c, z1), t6c - t5c, z3 - z1, linewidth=3, edgecolor='turquoise', facecolor='none', linestyle='solid')
+
+
+namefigure = figures_directory + '/Figure1_diff.png'
+
+fig,axs = plt.subplots(4,1,figsize=(14,14))
+
+plt.rcParams['font.size']=15
+
+plt.subplots_adjust(top=0.95, bottom=0.10, left=0.08, right=0.90, hspace=0.20)
+
+plt.draw()
+p0 = axs[0].get_position().get_points().flatten()
+
+cmap = get_cmap("bwr", 18)
+vmin = -40
+vmax = 40
+cs = axs[0].contour(wrf_time, ZZmiddle/1000, (tCONTROL.T), levels=np.arange(-50, 0, 5), colors='dimgray',linewidths=1)
+axs[0].clabel(cs, inline=True, fontsize=12, fmt='%d$^\circ$C', colors='dimgrey')
+axs[0].set_xlim(wrf_time[0], wrf_time[-1])
+axs[0].pcolormesh(wprof_time,Rgates,carmel_Ze_corr.T,vmin=-35,vmax=20,cmap="plasma")
+cax = fig.add_axes([0.92, 0.10, 0.02, 0.85])
+
+axs[0].set_ylabel('Altitude above'+'\nradar [km]')
+axs[0].add_patch(rect1)
+axs[0].add_patch(rect12)
+axs[0].add_patch(rect13)
+axs[0].set_ylim(0, 5)
+axs[0].set_yticks([0,1,2,3,4,5])
+axs[0].set_xticks(tick_locs)
+axs[0].set_xticklabels(tick_labels)
+axs[0].set_xticklabels([])
+axs[0].grid()
+text_loc = np.datetime64('2021-12-19T11:00:00')
+text =axs[0].text(text_loc, 4.5, '(a)', fontsize=14)
+#%%
+cs = axs[1].contour(wrf_time, ZZmiddle/1000, (tCONTROL.T), levels=np.arange(-50, 0, 5), colors='dimgray',linewidths=1)
+axs[1].clabel(cs, inline=True, fontsize=12, fmt='%d$^\circ$C', colors='dimgrey')
+axs[1].set_xlim(wrf_time[0], wrf_time[-1])
+axs[1].pcolormesh(to_np(wrf_time),to_np(ZZ)/1000,REFL_CONTROL.T - REFL_CONTROL_old.T,vmin=vmin,vmax=vmax,cmap=cmap)
+axs[1].set_ylabel('Altitude'+'\n [km]')
+axs[1].set_ylim(0, 5)
+axs[1].set_yticks([0,1,2,3,4,5])
+axs[1].add_patch(rect2)
+axs[1].add_patch(rect22)
+axs[1].add_patch(rect23)
+axs[1].set_xticks(tick_locs)
+axs[1].set_xticklabels(tick_labels)
+axs[1].set_xticklabels([])
+axs[1].grid()
+text =axs[1].text(text_loc, 4.5, '(b)', fontsize=14)
+
+cs = axs[2].contour(wrf_time, ZZmiddle2/1000, (tDEMOTT.T), levels=np.arange(-50, 0, 5), colors='dimgray',linewidths=1)
+axs[2].clabel(cs, inline=True, fontsize=12, fmt='%d$^\circ$C', colors='dimgrey')
+axs[2].set_xlim(wrf_time[0], wrf_time[-1])
+axs[2].pcolormesh(to_np(wrf_time),to_np(ZZ2)/1000,REFL_DEMOTT.T - REFL_DEMOTT_old.T,vmin=vmin,vmax=vmax,cmap=cmap)
+axs[2].set_ylabel('Altitude'+'\n [km]')
+axs[2].set_ylim(0, 5)
+axs[2].set_yticks([0,1,2,3,4,5])
+axs[2].add_patch(rect3)
+axs[2].add_patch(rect32)
+axs[2].add_patch(rect33)
+axs[2].set_xticks(tick_locs)
+axs[2].set_xticklabels(tick_labels)
+axs[2].set_xticklabels([])
+axs[2].grid()
+text =axs[2].text(text_loc, 4.5, '(c)', fontsize=14)
+
+cs = axs[3].contour(wrf_time, ZZmiddle3/1000, (tALLSIP.T), levels=np.arange(-50, 0, 5), colors='dimgray',linewidths=1)
+axs[3].clabel(cs, inline=True, fontsize=12, fmt='%d$^\circ$C', colors='dimgrey')
+axs[3].set_xlim(wrf_time[0], wrf_time[-1])
+im0 = axs[3].pcolormesh(to_np(wrf_time),to_np(ZZ3)/1000,REFL_ALLSIP.T - REFL_ALLSIP_old.T,vmin=vmin,vmax=vmax,cmap=cmap)
+axs[3].set_ylabel('Altitude'+'\n [km]')
+axs[3].set_ylim(0, 5)
+axs[3].set_yticks([0,1,2,3,4,5])
+axs[3].add_patch(rect4)
+axs[3].add_patch(rect42)
+axs[3].add_patch(rect43)
+axs[3].grid()
+axs[3].set_xlabel('Time [UTC]')
+axs[3].set_xticks(tick_locs)
+axs[3].set_xticklabels(tick_labels)
+text =axs[3].text(text_loc, 4.5, '(d)', fontsize=14)
+
+cbar = plt.colorbar(im0, cax=cax, orientation='vertical')
+cbar.set_label(r'Ze$_{W}$ [dBZ]', fontsize=16)
+cbar.ax.yaxis.set_ticks_position('right')
+
+plt.show()
+
+fig.savefig(namefigure, dpi=300, format="png", pil_kwargs={"compression": "tiff_lzw"}, bbox_inches='tight')
+
+
+
+
+# namefigure2 = figures_directory + '/FigureS1_diff.png'
+
+# fig,axs = plt.subplots(figsize=(14,7))
+
+# plt.subplots_adjust(top=0.87, bottom=0.12, left=0.08, right=0.95, hspace=0.20)
+
+# axs.plot(new_time_array, Wprof_median, color='dimgray',linewidth=2,label='WProf')
+# axs.fill_between(new_time_array, Wprof_p25, Wprof_p75, alpha=0.4, color='dimgray')
+
+# axs.plot(wrf_time,np.nanmedian(REFL_CONTROL[:,20:22],axis=1) - np.nanmedian(REFL_CONTROL_old[:,20:22],axis=1), color='black',linewidth=2.5,label='CONTROL')
+# axs.plot(wrf_time,np.nanmedian(REFL_DEMOTT[:,20:22],axis=1) - np.nanmedian(REFL_DEMOTT_old[:,20:22],axis=1), color='cyan',linewidth=2.5,label='DEMOTT')
+# axs.plot(wrf_time,np.nanmedian(REFL_ALLSIP[:,20:22],axis=1) - np.nanmedian(REFL_ALLSIP_old[:,20:22],axis=1), color='blue',linewidth=2.5,label='ALLSIP')
+
+# axs.set_xlim(wrf_time[0], wrf_time[-1])
+# axs.set_ylabel(r'Median Ze$_{W}$ [dBZ]')
+# axs.set_xlabel('Time [UTC]')
+# axs.set_xticks(tick_locs)
+# axs.set_xticklabels(tick_labels)
+# axs.set_ylim(-20,15)
+# axs.legend(loc='best',ncol=1)
+# axs.grid()
+
+# plt.show()
+
+# fig.savefig(namefigure2, dpi=300, format="png", pil_kwargs={"compression": "tiff_lzw"}, bbox_inches='tight')
+
+
+
+
+
+# namefigure3 = figures_directory + '/FigureS4.png'
+# fig, axs = plt.subplots(figsize=(8,10))
+
+# #WProf
+# it1 = np.searchsorted(radar_time, t1c, side="right")-1
+# it2 = np.searchsorted(radar_time, t2c, side="right")-1
+
+# #CONTROL
+# it3 = np.searchsorted(wrf_time, t3c, side="right")-1
+# it4 = np.searchsorted(wrf_time, t4c, side="right")-1
+
+# #ALLSIP
+# it5 = np.searchsorted(wrf_time, t5c, side="right")-1
+# it6 = np.searchsorted(wrf_time, t6c, side="right")-1
+
+# #DEMOTT
+# it7 = np.searchsorted(wrf_time, t7c, side="right")-1
+# it8 = np.searchsorted(wrf_time, t8c, side="right")-1
+
+
+# Ze_rad_med3 = np.nanmedian(carmel_Ze_corr[it1:it2], axis=0)
+# Ze_rad_25pct3 = np.nanpercentile(carmel_Ze_corr[it1:it2], 25, axis=0)
+# Ze_rad_75pct3 = np.nanpercentile(carmel_Ze_corr[it1:it2], 75, axis=0)
+# Ze_CONTROL_med3 = np.nanmedian(REFL_CONTROL[it3:it4], axis=0)
+# Ze_ALLSIP_med3 = np.nanmedian(REFL_ALLSIP[it5:it6], axis=0)
+# Ze_DEMOTT_med3 = np.nanmedian(REFL_DEMOTT[it7:it8], axis=0)
+
+# # create the interpolation function
+# t_ALLSIP_med3 = np.nanmedian(tALLSIP[it5:it6], axis=0)
+# interp_func = interp1d(t_ALLSIP_med3,ZZmiddle3/1000)
+
+# thr = 2
+
+# axs.plot(Ze_rad_med3,Rgates,'-',color='dimgray',linewidth=3,label='WProf')
+# axs.fill_betweenx(Rgates, Ze_rad_25pct3, Ze_rad_75pct3, color='dimgray', alpha=0.3)
+# axs.plot(Ze_CONTROL_med3[thr:],ZZ_km[thr:],'-',color='black',linewidth=2.5,label='CONTROL')
+# axs.plot(Ze_DEMOTT_med3[thr:],ZZ_km2[thr:],'-',color='cyan',linewidth=2.5,label='DEMOTT')
+# axs.plot(Ze_ALLSIP_med3[thr:],ZZ_km3[thr:],'-',color='blue',linewidth=2.5,label='ALLSIP')
+# axs.set_ylim(0,2)
+# axs.set_xlim(-35,25)
+# axs.set_xlabel(r'Median Ze$_{W}$ [dBZ]')
+# axs.set_ylabel("Altitude [km]")
+# axs.grid()
+
+# pos = 13.0
+
+# t12 = -12.0
+# iso12c = interp_func(t12)
+# axs.axhline(iso12c, color='black', linestyle='--', linewidth=2)
+# axs.text(pos, iso12c+0.02, '-12°C', color='black', fontsize=12)
+
+# t17 = -17.0
+# iso17c = interp_func(t17)
+# axs.axhline(iso17c, color='black', linestyle='--', linewidth=2)
+# axs.text(pos, iso17c+0.02, '-17°C', color='black', fontsize=12)
+
+# t20 = -20.0
+# iso20c = interp_func(t20)
+# axs.axhline(iso20c, color='black', linestyle='--', linewidth=2)
+# axs.text(pos, iso20c+0.02, '-20°C', color='black', fontsize=12)
+
+# axs.legend(loc='upper center', bbox_to_anchor=(0.48, 1.11), ncol=4)
+
+# plt.show()
+
+# fig.savefig(namefigure3, dpi=300, format="png", pil_kwargs={"compression": "tiff_lzw"}, bbox_inches='tight')
